@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64 release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Verify executable
+        run: |
+          $exe = "target/release/fshot.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          "size: $((Get-Item $exe).Length) bytes"
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: fshot-windows-x64
+          path: target/release/fshot.exe
+          if-no-files-found: error
+          retention-days: 14
