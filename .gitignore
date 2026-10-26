@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+*.log
+.idea/
+.vscode/
+/assets/icons/tray.png.bak
