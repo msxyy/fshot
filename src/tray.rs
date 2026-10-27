@@ -6,6 +6,7 @@ use tray_icon::{
 use winit::event_loop::EventLoopProxy;
 
 use crate::event::{TrayAction, UserEvent};
+use crate::hotkey::HotkeyAction;
 
 pub struct Tray {
     _icon: TrayIcon,
@@ -14,16 +15,24 @@ pub struct Tray {
 impl Tray {
     pub fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
         let menu = Menu::new();
-        let item_capture = MenuItem::new("截图 (Ctrl+Shift+S)", true, None);
+        let item_capture = MenuItem::new("截图", true, None);
+        let item_window = MenuItem::new("窗口截图", true, None);
         let item_settings = MenuItem::new("设置…", true, None);
         let item_sep = PredefinedMenuItem::separator();
         let item_quit = MenuItem::new("退出", true, None);
 
         let id_capture = item_capture.id().clone();
+        let id_window = item_window.id().clone();
         let id_settings = item_settings.id().clone();
         let id_quit = item_quit.id().clone();
 
-        menu.append_items(&[&item_capture, &item_settings, &item_sep, &item_quit])?;
+        menu.append_items(&[
+            &item_capture,
+            &item_window,
+            &item_settings,
+            &item_sep,
+            &item_quit,
+        ])?;
 
         let icon = build_icon()?;
         let tray = TrayIconBuilder::new()
@@ -37,6 +46,8 @@ impl Tray {
         MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
             let action = if ev.id == id_capture {
                 Some(UserEvent::TrayAction(TrayAction::Capture))
+            } else if ev.id == id_window {
+                Some(UserEvent::TrayAction(TrayAction::CaptureWindow))
             } else if ev.id == id_settings {
                 Some(UserEvent::TrayAction(TrayAction::Settings))
             } else if ev.id == id_quit {
@@ -60,7 +71,7 @@ impl Tray {
                     ..
                 }
             ) {
-                let _ = p_click.send_event(UserEvent::HotkeyTriggered);
+                let _ = p_click.send_event(UserEvent::Hotkey(HotkeyAction::Capture));
             }
         }));
 

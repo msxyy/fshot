@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Context, Pos2, Rect, Vec2};
@@ -19,11 +19,13 @@ use crate::{
     annotate::compose::compose,
     annotate::object::{Annotation, Kind, Tool},
     annotate::tool::Draft,
-    config::{AfterCapture, Config},
+    capture::screen::CapturedFrame,
+    config::{AfterCapture, Config, SettingsDraft},
     event::{TrayAction, UserEvent},
-    hotkey::HotkeyManager,
+    hotkey::{HotkeyAction, HotkeyManager},
     overlay::selection::{BORDER_HIT, HANDLE_HIT},
     overlay::OverlayState,
+    pin::{self, PinState},
     tray::Tray,
 };
 
@@ -34,6 +36,9 @@ pub struct App {
     tray: Option<Tray>,
     hotkey: Option<HotkeyManager>,
     gpu: Gpu,
+    /// 所有窗口共享一个 egui Renderer，避免新窗口缺少字体/纹理（egui Context 是共享的）。
+    renderer: Option<Arc<Mutex<Renderer>>>,
+    renderer_format: Option<wgpu::TextureFormat>,
     windows: HashMap<WindowId, WindowCtx>,
 }
 
@@ -47,7 +52,7 @@ struct Gpu {
 struct WindowCtx {
     window: Arc<Window>,
     egui_state: EguiState,
-    renderer: Renderer,
+    renderer: Arc<Mutex<Renderer>>,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     kind: WindowKind,
@@ -59,8 +64,16 @@ struct WindowCtx {
 }
 
 enum WindowKind {
-    Editor,
+    Settings(SettingsState),
     Overlay(OverlayState),
+    Pin(PinState),
+}
+
+struct SettingsState {
+    draft: SettingsDraft,
+    proxy: EventLoopProxy<UserEvent>,
+    error: Option<String>,
+    status: Option<String>,
 }
 
 impl App {
@@ -75,11 +88,9 @@ impl App {
             force_fallback_adapter: false,
         }))
         .expect("no suitable wgpu adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor::default(),
-            None,
-        ))
-        .expect("request_device failed");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .expect("request_device failed");
 
         let egui_ctx = Context::default();
         install_cjk_font(&egui_ctx);
@@ -90,7 +101,14 @@ impl App {
             egui_ctx,
             tray: None,
             hotkey: None,
-            gpu: Gpu { instance, adapter, device, queue },
+            gpu: Gpu {
+                instance,
+                adapter,
+                device,
+                queue,
+            },
+            renderer: None,
+            renderer_format: None,
             windows: HashMap::new(),
         }
     }
@@ -125,9 +143,15 @@ impl App {
             .unwrap_or(caps.formats[0]);
 
         let alpha_mode = if transparent {
-            if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            if caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+            {
                 wgpu::CompositeAlphaMode::PreMultiplied
-            } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            } else if caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+            {
                 wgpu::CompositeAlphaMode::PostMultiplied
             } else {
                 caps.alpha_modes[0]
@@ -160,7 +184,31 @@ impl App {
         let max_tex = self.gpu.device.limits().max_texture_dimension_2d as usize;
         egui_state.set_max_texture_side(max_tex);
 
-        let renderer = Renderer::new(&self.gpu.device, format, None, 1, false);
+        let renderer = match &self.renderer {
+            Some(existing) => {
+                if self.renderer_format != Some(format) {
+                    log::error!(
+                        "surface format {:?} differs from existing renderer {:?}",
+                        format,
+                        self.renderer_format
+                    );
+                    return None;
+                }
+                existing.clone()
+            }
+            None => {
+                let created = Arc::new(Mutex::new(Renderer::new(
+                    &self.gpu.device,
+                    format,
+                    None,
+                    1,
+                    false,
+                )));
+                self.renderer = Some(created.clone());
+                self.renderer_format = Some(format);
+                created
+            }
+        };
 
         let id = window.id();
         self.windows.insert(
@@ -183,11 +231,7 @@ impl App {
     }
 
     fn spawn_overlay(&mut self, event_loop: &ActiveEventLoop) {
-        if self
-            .windows
-            .values()
-            .any(|wc| matches!(wc.kind, WindowKind::Overlay(_)))
-        {
+        if self.has_overlay() {
             return;
         }
         let frames = match crate::capture::screen::capture_all() {
@@ -197,6 +241,26 @@ impl App {
                 return;
             }
         };
+        self.spawn_overlay_frames(event_loop, frames, false);
+    }
+
+    /// 截取当前前台窗口，并打开一个只覆盖该窗口的标注层。
+    fn spawn_window_capture(&mut self, event_loop: &ActiveEventLoop) {
+        if self.has_overlay() {
+            return;
+        }
+        match crate::capture::window::capture_focused() {
+            Ok(frame) => self.spawn_overlay_frames(event_loop, vec![frame], true),
+            Err(e) => log::error!("window capture failed: {e}"),
+        }
+    }
+
+    fn spawn_overlay_frames(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        frames: Vec<CapturedFrame>,
+        full_selection: bool,
+    ) {
         let prefs = self.config.tool_prefs.clone();
         log::info!("spawning {} overlay windows", frames.len());
         for frame in frames {
@@ -208,12 +272,13 @@ impl App {
                 .with_resizable(false)
                 .with_position(PhysicalPosition::new(frame.monitor_x, frame.monitor_y))
                 .with_inner_size(PhysicalSize::new(frame.width, frame.height));
-            if let Some(id) = self.build_window(
-                event_loop,
-                attrs,
-                WindowKind::Overlay(OverlayState::new(frame, &prefs)),
-                true,
-            ) {
+            let state = if full_selection {
+                OverlayState::new_with_full_selection(frame, &prefs)
+            } else {
+                OverlayState::new(frame, &prefs)
+            };
+            if let Some(id) = self.build_window(event_loop, attrs, WindowKind::Overlay(state), true)
+            {
                 if let Some(wc) = self.windows.get(&id) {
                     wc.window.set_cursor(CursorIcon::Crosshair);
                 }
@@ -221,19 +286,55 @@ impl App {
         }
     }
 
-    fn spawn_editor(&mut self, event_loop: &ActiveEventLoop) {
-        if self
-            .windows
+    fn has_overlay(&self) -> bool {
+        self.windows
             .values()
-            .any(|wc| matches!(wc.kind, WindowKind::Editor))
+            .any(|wc| matches!(wc.kind, WindowKind::Overlay(_)))
+    }
+
+    fn spawn_settings(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(id) = self
+            .windows
+            .iter()
+            .find(|(_, wc)| matches!(wc.kind, WindowKind::Settings(_)))
+            .map(|(id, _)| *id)
         {
+            if let Some(wc) = self.windows.get(&id) {
+                wc.window.request_redraw();
+                wc.window.focus_window();
+            }
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("fshot — M5")
-            .with_inner_size(LogicalSize::new(820.0, 520.0))
+            .with_title("fshot 设置")
+            .with_inner_size(LogicalSize::new(560.0, 480.0))
             .with_resizable(true);
-        self.build_window(event_loop, attrs, WindowKind::Editor, false);
+        let state = SettingsState {
+            draft: SettingsDraft::from_config(&self.config),
+            proxy: self.proxy.clone(),
+            error: None,
+            status: None,
+        };
+        self.build_window(event_loop, attrs, WindowKind::Settings(state), false);
+    }
+
+    /// 把合成后的图像作为置顶贴图窗口显示。
+    fn spawn_pin(&mut self, event_loop: &ActiveEventLoop, image: RgbaImage, x: i32, y: i32) {
+        let size = PhysicalSize::new(image.width().max(1), image.height().max(1));
+        let attrs = Window::default_attributes()
+            .with_title("fshot pin")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_position(PhysicalPosition::new(x, y))
+            .with_inner_size(size);
+        log::info!("pin {}x{} at ({x}, {y})", image.width(), image.height());
+        self.build_window(
+            event_loop,
+            attrs,
+            WindowKind::Pin(PinState::new(image)),
+            false,
+        );
     }
 
     fn teardown_overlay(&mut self) {
@@ -314,29 +415,22 @@ impl App {
         let surf_w = wc.surface_config.width;
         let surf_h = wc.surface_config.height;
         let scale = wc.window.scale_factor() as f32;
+        let window = wc.window.clone();
         let kind = &mut wc.kind;
 
         let mut request_close = false;
         let full_output = egui_ctx.run(raw_input, |c| match kind {
-            WindowKind::Editor => {
-                egui::CentralPanel::default().show(c, |ui| {
-                    ui.heading("fshot — M5");
-                    ui.add_space(8.0);
-                    ui.label(
-                        "Ctrl+Shift+S → 拖框 → 标注。\n\
-                         R/E/A/L/P/T/N/M 切工具，V Pointer，Ctrl+Z/Y 撤销重做。\n\
-                         Pointer 双击文本可再次编辑。\n\
-                         拖选区 8 个控制点缩放、拖边框整体移动，工具栏「⟲ 重选」重新框选。\n\
-                         Ctrl+S 保存 PNG（不关覆盖层），Enter 复制到剪贴板，Esc 取消。\n\
-                         工具/颜色/线宽/填充/字号/马赛克块 会自动记忆。",
-                    );
-                    ui.separator();
-                    ui.label(format!("窗口: {}x{}  scale={}", surf_w, surf_h, scale));
-                    ui.separator();
-                    if ui.button("关闭本窗口").clicked() {
-                        request_close = true;
-                    }
-                });
+            WindowKind::Settings(state) => {
+                draw_settings(c, state, &mut request_close);
+            }
+            WindowKind::Pin(state) => {
+                let resp = pin::draw(c, state, id);
+                if resp.drag {
+                    let _ = window.drag_window();
+                }
+                if resp.close {
+                    request_close = true;
+                }
             }
             WindowKind::Overlay(state) => {
                 crate::overlay::draw(c, state, surf_w as f32 / scale, surf_h as f32 / scale);
@@ -378,18 +472,22 @@ impl App {
         let mut encoder = self
             .gpu
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("egui") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("egui"),
+            });
+
+        let renderer = wc.renderer.clone();
+        let mut renderer = renderer.lock().unwrap();
 
         for (tid, delta) in &full_output.textures_delta.set {
-            wc.renderer
-                .update_texture(&self.gpu.device, &self.gpu.queue, *tid, delta);
+            renderer.update_texture(&self.gpu.device, &self.gpu.queue, *tid, delta);
         }
 
         let screen = ScreenDescriptor {
             size_in_pixels: [surf_w, surf_h],
             pixels_per_point: full_output.pixels_per_point,
         };
-        let extra_cmds = wc.renderer.update_buffers(
+        let extra_cmds = renderer.update_buffers(
             &self.gpu.device,
             &self.gpu.queue,
             &mut encoder,
@@ -400,9 +498,19 @@ impl App {
         {
             let is_overlay = matches!(kind, WindowKind::Overlay(_));
             let clear = if is_overlay {
-                wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+                wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }
             } else {
-                wgpu::Color { r: 0.10, g: 0.10, b: 0.12, a: 1.0 }
+                wgpu::Color {
+                    r: 0.10,
+                    g: 0.10,
+                    b: 0.12,
+                    a: 1.0,
+                }
             };
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -420,7 +528,7 @@ impl App {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
-            wc.renderer.render(&mut pass, &clipped, &screen);
+            renderer.render(&mut pass, &clipped, &screen);
         }
 
         self.gpu.queue.submit(
@@ -431,7 +539,7 @@ impl App {
         frame.present();
 
         for tid in &full_output.textures_delta.free {
-            wc.renderer.free_texture(tid);
+            renderer.free_texture(tid);
         }
 
         if request_close {
@@ -464,7 +572,8 @@ impl App {
     fn on_tray(&mut self, action: TrayAction, event_loop: &ActiveEventLoop) {
         match action {
             TrayAction::Capture => self.spawn_overlay(event_loop),
-            TrayAction::Settings => self.spawn_editor(event_loop),
+            TrayAction::CaptureWindow => self.spawn_window_capture(event_loop),
+            TrayAction::Settings => self.spawn_settings(event_loop),
             TrayAction::Quit => {
                 // 退出前也保存一次工具偏好
                 for wc in self.windows.values() {
@@ -477,6 +586,63 @@ impl App {
             }
         }
     }
+
+    /// 设置窗口点击「保存并应用」后：校验目录、重绑热键、落盘配置。
+    fn apply_settings(&mut self, draft: SettingsDraft) {
+        let save_dir = draft.save_dir.trim().to_string();
+        if save_dir.is_empty() {
+            self.set_settings_message(Some("保存目录不能为空".into()), None);
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&save_dir) {
+            self.set_settings_message(Some(format!("保存目录不可用：{e}")), None);
+            return;
+        }
+
+        let capture_hotkey = draft.hotkey.trim().to_string();
+        let window_hotkey = draft.window_hotkey.trim().to_string();
+        let hotkey_result = match self.hotkey.as_mut() {
+            Some(manager) => manager.rebind(&capture_hotkey, &window_hotkey),
+            None => match HotkeyManager::new(&capture_hotkey, &window_hotkey, self.proxy.clone()) {
+                Ok(manager) => {
+                    self.hotkey = Some(manager);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = hotkey_result {
+            self.set_settings_message(Some(format!("热键应用失败：{e}")), None);
+            return;
+        }
+
+        self.config.hotkey = capture_hotkey;
+        self.config.window_hotkey = window_hotkey;
+        self.config.after_capture = draft.after_capture;
+        self.config.save_dir = save_dir;
+        if let Err(e) = self.config.save() {
+            self.set_settings_message(Some(format!("保存配置失败：{e}")), None);
+            return;
+        }
+        self.set_settings_message(None, Some("已保存并应用".into()));
+        log::info!(
+            "settings applied: hotkey={}, window_hotkey={}, after_capture={:?}, save_dir={}",
+            self.config.hotkey,
+            self.config.window_hotkey,
+            self.config.after_capture,
+            self.config.save_dir
+        );
+    }
+
+    fn set_settings_message(&mut self, error: Option<String>, status: Option<String>) {
+        for wc in self.windows.values_mut() {
+            if let WindowKind::Settings(state) = &mut wc.kind {
+                state.error = error.clone();
+                state.status = status.clone();
+                wc.window.request_redraw();
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -486,12 +652,20 @@ impl ApplicationHandler<UserEvent> for App {
                 Ok(t) => self.tray = Some(t),
                 Err(e) => log::error!("tray init failed: {e}"),
             }
-            match HotkeyManager::new(&self.config.hotkey, self.proxy.clone()) {
+            match HotkeyManager::new(
+                &self.config.hotkey,
+                &self.config.window_hotkey,
+                self.proxy.clone(),
+            ) {
                 Ok(h) => self.hotkey = Some(h),
                 Err(e) => log::error!("hotkey init failed: {e}"),
             }
             let _ = self.config.save();
-            log::info!("fshot ready (hotkey = {})", self.config.hotkey);
+            log::info!(
+                "fshot ready (hotkey = {}, window_hotkey = {})",
+                self.config.hotkey,
+                self.config.window_hotkey
+            );
         }
         let _ = event_loop;
     }
@@ -585,12 +759,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         wc.last_click = None;
                                     } else {
                                         let now = Instant::now();
-                                        let double_click =
-                                            wc.last_click.is_some_and(|(t, p)| {
-                                                now.duration_since(t)
-                                                    <= Duration::from_millis(450)
-                                                    && p.distance(pos) <= 8.0
-                                            });
+                                        let double_click = wc.last_click.is_some_and(|(t, p)| {
+                                            now.duration_since(t) <= Duration::from_millis(450)
+                                                && p.distance(pos) <= 8.0
+                                        });
                                         wc.last_click = Some((now, pos));
 
                                         if state.selection.rect.is_none() {
@@ -600,16 +772,11 @@ impl ApplicationHandler<UserEvent> for App {
                                                 state.selection.hit_handle(pos, HANDLE_HIT)
                                             {
                                                 state.selection.start_resize(handle);
-                                            } else if state
-                                                .selection
-                                                .hit_border(pos, BORDER_HIT)
-                                            {
+                                            } else if state.selection.hit_border(pos, BORDER_HIT) {
                                                 state.selection.start_move(pos);
                                             } else if state.tool.active == Tool::Pointer {
                                                 // 双击文本标注 → 二次编辑
-                                                if !(double_click
-                                                    && begin_text_edit(state, pos))
-                                                {
+                                                if !(double_click && begin_text_edit(state, pos)) {
                                                     let hit = state
                                                         .history
                                                         .items
@@ -619,8 +786,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                         .map(|a| a.id);
                                                     state.selected_id = hit;
                                                     if let Some(aid) = hit {
-                                                        state.drag_annotation =
-                                                            Some((aid, pos));
+                                                        state.drag_annotation = Some((aid, pos));
                                                         state.drag_dirty = false;
                                                     }
                                                 }
@@ -668,9 +834,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         state.tool.text_edit = None;
                                     }
                                     Key::Named(NamedKey::Enter) => {
-                                        if let Some((aid, buf, pos)) =
-                                            state.tool.text_edit.take()
-                                        {
+                                        if let Some((aid, buf, pos)) = state.tool.text_edit.take() {
                                             let trimmed = buf.trim().to_string();
                                             if !trimmed.is_empty() {
                                                 if aid == 0 {
@@ -699,13 +863,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 match &kev.logical_key {
                                     Key::Character(s) if s.eq_ignore_ascii_case("z") => {
                                         state.history.undo();
-                                        state.tool.next_step =
-                                            state.history.max_step_number() + 1;
+                                        state.tool.next_step = state.history.max_step_number() + 1;
                                     }
                                     Key::Character(s) if s.eq_ignore_ascii_case("y") => {
                                         state.history.redo();
-                                        state.tool.next_step =
-                                            state.history.max_step_number() + 1;
+                                        state.tool.next_step = state.history.max_step_number() + 1;
                                     }
                                     Key::Character(s) if s.eq_ignore_ascii_case("s") => {
                                         save_request = true;
@@ -719,9 +881,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         action = Some(UserEvent::CaptureCancelled);
                                     }
                                     Key::Named(NamedKey::Enter) => {
-                                        action = Some(UserEvent::CaptureConfirmed {
-                                            window: id,
-                                        });
+                                        action = Some(UserEvent::CaptureConfirmed { window: id });
                                     }
                                     Key::Named(NamedKey::Delete)
                                     | Key::Named(NamedKey::Backspace) => {
@@ -800,8 +960,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::HotkeyTriggered => self.spawn_overlay(event_loop),
+            UserEvent::Hotkey(HotkeyAction::Capture) => self.spawn_overlay(event_loop),
+            UserEvent::Hotkey(HotkeyAction::WindowCapture) => self.spawn_window_capture(event_loop),
             UserEvent::TrayAction(a) => self.on_tray(a, event_loop),
+            UserEvent::ApplySettings(draft) => self.apply_settings(draft),
             UserEvent::CaptureCancelled => self.teardown_overlay(),
             UserEvent::CaptureConfirmed { window } => {
                 let overlay_ids: Vec<WindowId> = self
@@ -811,10 +973,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|(id, _)| *id)
                     .collect();
 
-                let mut focused = None;
-                let mut fallback = None;
+                let mut parts: Vec<(i32, i32, RgbaImage)> = Vec::new();
                 let mut selected_screens = 0usize;
                 let mut total = 0usize;
+                let mut annotation_count = 0usize;
                 let mut last_prefs = None;
                 for id in overlay_ids {
                     if let Some(wc) = self.windows.remove(&id) {
@@ -825,65 +987,71 @@ impl ApplicationHandler<UserEvent> for App {
                                 last_prefs = Some(prefs);
                             }
                             if let Some(sel) = state.selection.rect {
-                                selected_screens += 1;
-                                let payload = (
-                                    state.frame,
-                                    sel,
-                                    state.screen_size,
-                                    state.history.items.clone(),
-                                    state.tool.mosaic_block,
-                                );
-                                if id == window {
-                                    focused = Some(payload);
-                                } else if fallback.is_none() {
-                                    fallback = Some(payload);
+                                if state.screen_size.x > 0.0 && state.screen_size.y > 0.0 {
+                                    selected_screens += 1;
+                                    let items = state.history.items.clone();
+                                    annotation_count += items.len();
+                                    let img = compose(
+                                        &state.frame,
+                                        sel,
+                                        state.screen_size,
+                                        &items,
+                                        state.tool.mosaic_block,
+                                    );
+                                    let (ox, oy) =
+                                        selection_origin(&state.frame, sel, state.screen_size);
+                                    parts.push((ox, oy, img));
                                 }
                             }
                         }
                     }
                 }
 
-                if selected_screens > 1 {
-                    log::warn!(
-                        "{selected_screens} screens have a selection; only the focused screen \
-                         (or the first non-empty one) is copied"
-                    );
-                }
-                let captured = focused.or(fallback);
-                log::info!("CaptureConfirmed: {} overlay(s) closed", total);
+                log::info!(
+                    "CaptureConfirmed: {} overlay(s) closed, {} selected",
+                    total,
+                    selected_screens
+                );
                 if let Some(p) = last_prefs {
                     self.config.tool_prefs = p;
                     let _ = self.config.save();
                 }
+                if parts.is_empty() {
+                    log::info!("no non-empty selection; nothing captured");
+                    return;
+                }
 
-                if let Some((frame, sel, screen_size, items, mosaic_block)) = captured {
-                    if screen_size.x > 0.0 && screen_size.y > 0.0 {
-                        let img = compose(&frame, sel, screen_size, &items, mosaic_block);
-                        match &self.config.after_capture {
-                            AfterCapture::Clipboard => copy_image(&img, items.len()),
-                            AfterCapture::Save => {
-                                match crate::output::save_png(&img, &self.config.save_dir) {
-                                    Ok(path) => log::info!(
-                                        "saved {}x{} (with {} annotations) → {}",
-                                        img.width(),
-                                        img.height(),
-                                        items.len(),
-                                        path.display()
-                                    ),
-                                    Err(e) => log::error!("save png: {e}"),
-                                }
-                            }
-                            AfterCapture::None => {
-                                log::info!("after_capture = none; image dropped");
-                            }
-                            AfterCapture::Pin => {
-                                log::warn!(
-                                    "after_capture = pin 尚未实现，暂时复制到剪贴板"
-                                );
-                                copy_image(&img, items.len());
-                            }
-                        }
+                let origin_x = parts.iter().map(|(x, _, _)| *x).min().unwrap_or(0);
+                let origin_y = parts.iter().map(|(_, y, _)| *y).min().unwrap_or(0);
+                let part_count = parts.len();
+                let img = crate::output::merge_images(&parts);
+                if part_count > 1 {
+                    log::info!(
+                        "merged {} selections into {}x{}",
+                        part_count,
+                        img.width(),
+                        img.height()
+                    );
+                }
+
+                let after = self.config.after_capture;
+                let save_dir = self.config.save_dir.clone();
+                match after {
+                    AfterCapture::Clipboard => copy_image(&img, annotation_count),
+                    AfterCapture::Save => match crate::output::save_png(&img, &save_dir) {
+                        Ok(path) => log::info!(
+                            "saved {}x{} (with {} annotations) → {}",
+                            img.width(),
+                            img.height(),
+                            annotation_count,
+                            path.display()
+                        ),
+                        Err(e) => log::error!("save png: {e}"),
+                    },
+                    AfterCapture::None => {
+                        log::info!("after_capture = none; image dropped");
                     }
+                    AfterCapture::Pin => self.spawn_pin(event_loop, img, origin_x, origin_y),
                 }
             }
             UserEvent::PinClosed(id) => {
@@ -894,6 +1062,112 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 // ---- 辅助函数 ----
+
+fn draw_settings(ctx: &Context, state: &mut SettingsState, request_close: &mut bool) {
+    let mut apply = false;
+    let mut open_dir = false;
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.heading("fshot 设置");
+        ui.add_space(6.0);
+
+        ui.label("截图热键（格式如 Ctrl+Shift+S）");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.draft.hotkey)
+                .desired_width(280.0)
+                .hint_text("Ctrl+Shift+S"),
+        );
+        ui.add_space(4.0);
+
+        ui.label("窗口截图热键（截取当前前台窗口）");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.draft.window_hotkey)
+                .desired_width(280.0)
+                .hint_text("Ctrl+Shift+W"),
+        );
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label("截图完成后");
+        ui.horizontal_wrapped(|ui| {
+            for action in [
+                AfterCapture::Clipboard,
+                AfterCapture::Save,
+                AfterCapture::Pin,
+                AfterCapture::None,
+            ] {
+                ui.radio_value(&mut state.draft.after_capture, action, action.label());
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.label("保存目录");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut state.draft.save_dir)
+                    .desired_width(360.0)
+                    .hint_text("PNG 保存位置"),
+            );
+            if ui.button("打开").clicked() {
+                open_dir = true;
+            }
+        });
+
+        ui.add_space(8.0);
+        if let Some(err) = &state.error {
+            ui.colored_label(Color32::from_rgb(235, 90, 90), err);
+        }
+        if let Some(status) = &state.status {
+            ui.colored_label(Color32::from_rgb(90, 190, 110), status);
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("保存并应用").clicked() {
+                apply = true;
+            }
+            if ui.button("关闭").clicked() {
+                *request_close = true;
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.label(format!("配置文件：{}", Config::path().display()));
+        ui.label("提示：热键被其他程序占用时会保留原热键；窗口截图默认 Ctrl+Shift+W。");
+    });
+
+    if open_dir {
+        let dir = state.draft.save_dir.trim().to_string();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            state.error = Some(format!("创建目录失败：{e}"));
+        } else if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+            state.error = Some(format!("打开目录失败：{e}"));
+        }
+    }
+
+    if apply {
+        state.error = None;
+        state.status = Some("正在应用…".into());
+        if state
+            .proxy
+            .send_event(UserEvent::ApplySettings(state.draft.clone()))
+            .is_err()
+        {
+            state.error = Some("应用失败：事件循环已关闭".into());
+            state.status = None;
+        }
+    }
+}
+
+/// 选区左上角在虚拟桌面物理坐标中的位置。
+fn selection_origin(frame: &CapturedFrame, sel: Rect, screen_size: Vec2) -> (i32, i32) {
+    let sx = frame.width as f32 / screen_size.x.max(1.0);
+    let sy = frame.height as f32 / screen_size.y.max(1.0);
+    (
+        frame.monitor_x + (sel.min.x * sx).round() as i32,
+        frame.monitor_y + (sel.min.y * sy).round() as i32,
+    )
+}
 
 fn copy_image(img: &RgbaImage, annotations: usize) {
     match crate::output::copy_to_clipboard(img) {
@@ -1009,12 +1283,14 @@ fn finish_draft(state: &mut OverlayState) {
             rect: Rect::from_two_pos(start, current),
             fill,
         }),
-        (Tool::Arrow, Draft::Shape { start, current }) => {
-            Some(Kind::Arrow { from: start, to: current })
-        }
-        (Tool::Line, Draft::Shape { start, current }) => {
-            Some(Kind::Line { from: start, to: current })
-        }
+        (Tool::Arrow, Draft::Shape { start, current }) => Some(Kind::Arrow {
+            from: start,
+            to: current,
+        }),
+        (Tool::Line, Draft::Shape { start, current }) => Some(Kind::Line {
+            from: start,
+            to: current,
+        }),
         (Tool::Pen, Draft::Pen(points)) => {
             if points.len() >= 2 {
                 Some(Kind::Pen { points })
@@ -1038,7 +1314,31 @@ fn finish_draft(state: &mut OverlayState) {
             _ => false,
         };
         if !too_small {
-            state.history.push(Annotation { id: 0, kind: k, style });
+            state.history.push(Annotation {
+                id: 0,
+                kind: k,
+                style,
+            });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_origin_uses_dpi_scale_and_monitor_offset() {
+        let frame = CapturedFrame {
+            width: 3840,
+            height: 2160,
+            pixels: RgbaImage::new(1, 1),
+            monitor_x: -1920,
+            monitor_y: 0,
+            scale: 2.0,
+        };
+        let sel = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(10.0, 10.0));
+        let origin = selection_origin(&frame, sel, Vec2::new(1920.0, 1080.0));
+        assert_eq!(origin, (-1720, 100));
     }
 }

@@ -2,7 +2,8 @@ pub mod selection;
 pub mod toolbar;
 
 use egui::{
-    Color32, ColorImage, CursorIcon, LayerId, Order, Pos2, Rect, TextureHandle, TextureOptions, Vec2,
+    Color32, ColorImage, CursorIcon, LayerId, Order, Pos2, Rect, TextureHandle, TextureOptions,
+    Vec2,
 };
 use image::{Rgba, RgbaImage};
 
@@ -30,6 +31,8 @@ pub struct OverlayState {
     pub drag_annotation: Option<(u64, Pos2)>,
     /// 本次拖动标注是否已经记录撤销快照
     pub drag_dirty: bool,
+    /// 窗口截图：首帧把整个窗口作为选区
+    pub preset_full: bool,
 }
 
 impl OverlayState {
@@ -49,7 +52,15 @@ impl OverlayState {
             selected_id: None,
             drag_annotation: None,
             drag_dirty: false,
+            preset_full: false,
         }
+    }
+
+    /// 窗口截图用：整个窗口预选为选区，打开后可直接标注/确认。
+    pub fn new_with_full_selection(frame: CapturedFrame, prefs: &ToolPrefs) -> Self {
+        let mut s = Self::new(frame, prefs);
+        s.preset_full = true;
+        s
     }
 }
 
@@ -59,11 +70,7 @@ pub fn draw(ctx: &egui::Context, state: &mut OverlayState, view_w: f32, view_h: 
             [state.frame.width as usize, state.frame.height as usize],
             state.frame.pixels.as_raw(),
         );
-        state.texture = Some(ctx.load_texture(
-            "fshot-overlay-src",
-            img,
-            TextureOptions::NEAREST,
-        ));
+        state.texture = Some(ctx.load_texture("fshot-overlay-src", img, TextureOptions::NEAREST));
     }
     // 工具栏里的「块」是逻辑点；换算成截图像素后再生成马赛克纹理，
     // 保证预览块大小与导出（compose 里按 scale 放大）一致。
@@ -87,9 +94,16 @@ pub fn draw(ctx: &egui::Context, state: &mut OverlayState, view_w: f32, view_h: 
 
     let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(view_w, view_h));
     state.screen_size = screen.size();
+    if state.preset_full {
+        state.preset_full = false;
+        state.selection.rect = Some(screen);
+        state.hovering = Some(screen.center());
+    }
 
-    let painter =
-        ctx.layer_painter(LayerId::new(Order::Background, egui::Id::new("fshot-overlay")));
+    let painter = ctx.layer_painter(LayerId::new(
+        Order::Background,
+        egui::Id::new("fshot-overlay"),
+    ));
 
     let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0_f32, 1.0_f32));
     painter.image(tex_id, screen, full_uv, Color32::WHITE);
@@ -314,6 +328,25 @@ mod tests {
         assert_eq!(mosaic_block_px(16, 3840, 1920.0), 32);
         assert_eq!(mosaic_block_px(16, 2400, 1920.0), 20);
         assert_eq!(mosaic_block_px(1, 1920, 1920.0), 2);
+    }
+
+    #[test]
+    fn preset_full_selection_covers_first_frame() {
+        let ctx = egui::Context::default();
+        let mut state = OverlayState::new_with_full_selection(
+            test_frame(),
+            &crate::config::ToolPrefs::default(),
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 200.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |c| draw(c, &mut state, 320.0, 200.0));
+        assert_eq!(
+            state.selection.rect,
+            Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 200.0)))
+        );
+        assert!(!state.preset_full);
     }
 
     #[test]
